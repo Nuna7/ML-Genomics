@@ -1,0 +1,24 @@
+./encode_work
+
+.DS_Store
+.AppleDouble
+.LSOverride
+._*
+
+.vscode/*
+!.vscode/extensions.json
+!.vscode/launch.json
+!.vscode/settings.json
+
+*.log
+*.pid
+*.seed
+*.crash
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+venv/
+.venv/
+env/
