@@ -406,7 +406,7 @@ def plot_region(
     leftmost.yaxis.set_major_locator(ticker.MaxNLocator(nbins=6))
     leftmost.set_ylabel(f"y: {chrom} (GRCh38, Mb)", fontsize=11, labelpad=40)
 
- 
+
     # Hi-C
     log_mat = np.log1p(mat)
     if symmetric and mat.shape[0] > 1:
@@ -417,12 +417,20 @@ def plot_region(
 
     nonzero = log_mat[log_mat > 0]
     vmax = max(0.6, np.percentile(nonzero, 97) if len(nonzero) > 0 else 1.0)
+    
+    im = ax_hic.imshow(
+        display,
+        cmap=_HIC_CMAP,
+        interpolation="nearest",
+        aspect="equal",
+        origin="upper",
+        extent=[x_start, x_end, y_end, y_start],    
+        vmin=0,
+        vmax=vmax,
+    )
 
-    im = ax_hic.imshow(display.T, cmap=_HIC_CMAP, interpolation="nearest", aspect="auto",
-                    origin="lower", extent=[x_start, x_end, y_start, y_end],
-                    vmin=0, vmax=vmax)
     ax_hic.set_xlim(x_start, x_end)
-    ax_hic.set_ylim(y_start, y_end)
+    ax_hic.set_ylim(y_end, y_start)
 
     # Kill offset the right way: set ScalarFormatter first, disable offset, then swap to FuncFormatter
     ax_hic.ticklabel_format(style='plain', useOffset=False)
