@@ -384,23 +384,7 @@ def make_warmup_lr_lambda(warmup_steps: int):
     Returns a function step -> lr_multiplier suitable for
     torch.optim.lr_scheduler.LambdaLR. Linearly ramps the multiplier from
     ~0 to 1.0 over the first `warmup_steps` optimizer steps, then holds at
-    1.0 (no decay after warmup -- this is intentionally just warmup, not a
-    full schedule, to keep the comparison to the no-warmup baseline as
-    close to apples-to-apples as possible: only the first warmup_steps
-    steps differ).
-
-    warmup_steps=0 returns a constant multiplier of 1.0 (i.e. a no-op,
-    equivalent to not using a scheduler at all).
-
-    NOTE on exact values logged in lr_at_epoch_end: torch's LambdaLR
-    applies lr_lambda(0) at scheduler CONSTRUCTION time, before the first
-    .step() call -- so after N calls to scheduler.step(), the effective
-    multiplier is lr_lambda(N), not lr_lambda(N-1). Concretely, with
-    warmup_steps=8 and 4 optimizer steps/epoch, the multiplier at the end
-    of epoch 1 is (4+1)/8 = 0.625, not 4/8 = 0.5 as naive hand-arithmetic
-    might suggest. This is standard PyTorch behavior, not a bug here --
-    documented so the lr_at_epoch_end column in training_log.csv doesn't
-    look "off" if you sanity-check it by hand.
+    1.0 (no decay after warmup).
     """
     if warmup_steps <= 0:
         return lambda step: 1.0

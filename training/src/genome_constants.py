@@ -4,9 +4,7 @@ genome_constants.py
 Pure constants, zero external dependencies. Kept separate from genomic_io.py
 on purpose: scripts that only need chromosome lengths (like make_windows.py)
 should not be forced to have pyBigWig / hic-straw installed just to import
-this. If you find yourself tempted to merge this back into genomic_io.py,
-don't -- that was tried and it broke manifest generation on machines without
-the heavy genomics libs installed.
+this.
 """
 from __future__ import annotations
 

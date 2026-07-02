@@ -2,29 +2,6 @@
 genomic_io.py
 -------------
 Low-level fetchers for Hi-C matrices and 1D signal tracks (bigWig).
-
-This module deliberately reuses the exact logic from the visualization
-script (encode_multitrack_plot.py) for hic_matrix() and read_bigwig(),
-since that logic has already been visually validated against known loci
-(MYC, HOXA). Keeping it identical means: if a window looks right in the
-PNG figures, it will be numerically identical to what the model sees.
-
-Do NOT "improve" the normalization or binning logic here without also
-re-checking it against the visualizations, or you'll have two pipelines
-that disagree silently.
-
-IMPORT STRATEGY: pyBigWig and hicstraw are imported LAZILY, inside the
-functions that actually use them (hic_matrix, read_bigwig), not at module
-level. This is deliberate: hicstraw in particular is a C-extension package
-that needs libcurl dev headers to build from source on some systems, and
-not everyone working on this codebase (e.g. someone writing/testing the
-training loop, the manifest logic, or the model architectures with
-synthetic data) needs those installed. With a module-level import, simply
-doing `from dataset import HiCWindowDataset` would hard-fail on a machine
-that hasn't installed these, even if that code path never calls
-hic_matrix/read_bigwig. With lazy imports, the failure only happens at the
-point where real genomic data fetching is actually attempted, which is
-the only point where the dependency is actually needed.
 """
 from __future__ import annotations
 
@@ -75,7 +52,6 @@ def download_file(url: str, out_path: Path, chunk_mb: int = 8, max_retries: int 
             time.sleep(wait)
     raise RuntimeError(f"Download failed after {max_retries} attempts: {url}")
 
-
 def hic_matrix(
     hic_source: str,
     chrom: str,
@@ -122,15 +98,6 @@ def hic_matrix(
                 f"Chromosome '{chrom}' not found in Hi-C file. Available: {names}"
             )
 
-    # norm = "NONE"
-    # for candidate in ("SCALE", "VC", "NONE"):
-    #     try:
-    #         hf.getMatrixZoomData(key, key, "observed", candidate, "BP", bin_size_used)
-    #         norm = candidate
-    #         break
-    #     except Exception:
-    #         continue
-
     n = max(1, int(np.ceil((end - start) / bin_size_used)))
 
     mzd = hf.getMatrixZoomData(
@@ -149,7 +116,6 @@ def hic_matrix(
     mat[:r0, :c0] = raw[:r0, :c0]
     return mat, bin_size_used
 
-
 def read_bigwig(
     bw_path: Path,
     chrom: str,
@@ -158,24 +124,48 @@ def read_bigwig(
     bins: int,
     clip_pct: float = 99.0,
 ) -> np.ndarray:
-    """
-    Mean signal per bin over [start, end), same logic as the viz script's
-    read_bigwig but returns only the y-values (we control x-positions by
-    construction in the dataset, so no need to recompute them here).
-    """
     try:
         import pyBigWig
     except ImportError as e:
-        raise ImportError(
-            "read_bigwig() requires the 'pyBigWig' package, which is not "
-            "installed. Install with: pip install pyBigWig"
-        ) from e
+        raise ImportError(...) from e
 
     bw = pyBigWig.open(str(bw_path))
     try:
-        raw = bw.stats(chrom, start, end, type="mean", nBins=bins, exact=True)
+        # Chromosome name normalization (match hic_matrix logic)
+        chrom_key = chrom
+        chroms = bw.chroms()
+        if chrom_key not in chroms:
+            alt = chrom.replace("chr", "")
+            if alt in chroms:
+                chrom_key = alt
+            elif f"chr{alt}" in chroms:
+                chrom_key = f"chr{alt}"
+            else:
+                # Fallback / debug
+                print(f"[WARN] Chromosome {chrom} not found in {bw_path.name}. Available: {list(chroms.keys())[:10]}...")
+                # Return zeros to avoid crash (or raise)
+                return np.zeros(bins, dtype=np.float32)
+
+        # Clamp to bigWig chromosome length
+        clen = chroms[chrom_key]
+        start = int(start)
+        end = int(end)
+
+        if start < 0:
+            start = 0
+        if start >= clen:
+            print(f"[WARN] Interval starts beyond chromosome end: {chrom_key}:{start}-{end} (len={clen})")
+            return np.zeros(bins, dtype=np.float32)
+
+        end = min(end, clen)
+        if end <= start:
+            print(f"[WARN] Invalid interval after clamp: {chrom_key}:{start}-{end} (len={clen})")
+            return np.zeros(bins, dtype=np.float32)
+
+        raw = bw.stats(chrom_key, start, end, type="mean", nBins=bins, exact=True)
     finally:
         bw.close()
+
     y = np.nan_to_num(np.array(raw, dtype=float), nan=0.0)
     if clip_pct < 100 and y.max() > 0:
         cap = np.percentile(y[y > 0], clip_pct)

@@ -1,1 +1,1 @@
-pip install requests pandas numpy matplotlib pybigwig biopython pysam hic-straw torch
+pip install requests pandas numpy matplotlib pybigwig biopython pysam hic-straw torch modal pyyaml

@@ -9,20 +9,6 @@ train.py) and produces:
     distance-corrected structure, not just the easy distance trend)
   - a markdown summary table of best val metrics per model
 
-IMPORTANT INTERPRETATION NOTE printed at the end of this script's output:
-this comparison uses each model's OWN best epoch (by val_loss), not a
-fixed epoch count, specifically because the three architectures converge
-at different speeds (see model_transformer.py's docstring -- the
-Transformer needs more steps due to its near-uniform attention at
-initialization). Comparing "epoch 40 of CNN" to "epoch 40 of Transformer"
-would not be a fair comparison if the Transformer simply hasn't finished
-converging yet at that point; comparing best-epoch-of-each is the more
-defensible choice, but it does mean a model that trained for MORE epochs
-had more chances to find a low validation loss. If you want to control for
-total training compute rather than total epochs, additionally compare
-wall-clock training time (logged per-epoch in epoch_seconds) alongside
-the loss numbers, not just best val_loss in isolation.
-
 Usage:
     python compare_models.py \
         --cnn-dir runs/cnn_run1 \

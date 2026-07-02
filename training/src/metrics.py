@@ -1,44 +1,7 @@
 """
 metrics.py
 ----------
-Loss functions and evaluation metrics for comparing predicted vs ground-truth
-Hi-C contact maps (both already in log1p space, as produced by HiCWindowDataset).
-
-Why not just MSE alone:
-
-MSE treats every pixel as equally important, but Hi-C maps are dominated
-by genomic distance: pixels near the diagonal (short-range contacts) have
-much higher values and variance than pixels far from the diagonal
-(long-range contacts), simply because of polymer physics (closer-in-
-sequence DNA contacts more often), not because of any interesting
-biological signal. A model that just learns "predict high near the
-diagonal, low far away" gets a deceptively good MSE without learning
-anything about which SPECIFIC TADs or loops exist in a specific window --
-which is presumably the actual scientific question.
-
-This is why the field's standard evaluation is the Akita-style approach:
-compute metrics AFTER removing or controlling for the distance-dependent
-mean trend. Two such metrics are implemented here:
-
-1. distance_stratified_mse: MSE computed separately for each
-   diagonal-distance band, then averaged across bands. This stops the
-   (easy, distance-trivial) short-range pixels from drowning out errors
-   in the (hard, biologically interesting) long-range pixels in the
-   aggregate score.
-
-2. stratum_adjusted_correlation: for each diagonal-distance band,
-   subtract the mean true value at that distance from both prediction
-   and target (a crude per-distance detrending), then compute Pearson
-   correlation across all pixels at all distances pooled together. This
-   directly measures "does the model capture WHICH pixels are unusually
-   high/low for their distance" (i.e. specific loops/TADs), which a raw
-   correlation or raw MSE would not isolate, since raw correlation is
-   already very high for any model that's roughly right about the strong
-   decay trend with distance.
-
-Both metrics are computed per-window and then averaged across the
-evaluation set; they assume input matrices are already symmetric
-(true for the Dataset's targets, and for these models' outputs).
+Loss functions and evaluation metrics for comparing predicted vs ground-truth Hi-C contact maps.
 """
 from __future__ import annotations
 
@@ -47,12 +10,10 @@ import torch
 
 
 def mse_loss(pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
-    """Plain pixelwise MSE. Used as the actual training loss (simple,
-    well-behaved gradients) -- the stratified metrics below are for
-    EVALUATION/REPORTING, not for backprop, since they involve
-    per-distance-band statistics that are awkward and unnecessary to
-    differentiate through during training."""
     return torch.nn.functional.mse_loss(pred, target)
+
+def huber_loss(pred: torch.Tensor, target: torch.Tensor, delta: float = 1.0) -> torch.Tensor:
+    return torch.nn.functional.huber_loss(pred, target, delta=delta)
 
 
 def _distance_bands(n_bins: int, n_bands: int = 10) -> np.ndarray:

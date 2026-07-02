@@ -4,22 +4,12 @@ make_windows.py
 Generates the list of (chrom, start, end) windows that will become
 training/validation/test examples, and writes them to a manifest CSV.
 
-THE SINGLE MOST IMPORTANT PROPERTY OF THIS FILE: chromosome-level split.
-
 Hi-C contact frequency and 1D signal tracks are spatially autocorrelated --
 a window starting at chr8:1,000,000 is highly similar to one starting at
 chr8:1,010,000. If you split *windows* randomly into train/val/test, the
 model can partially memorize neighboring training windows when it sees a
 "held out" window next door, and your validation/test metrics will look
-much better than the model actually generalizes. This is a textbook
-genomics-ML leakage bug and it is silent -- nothing will crash, your loss
-curves will look great, and the result will not replicate on truly new
-data.
-
-The fix used here is standard in the field (Akita, this kind of model in
-general): hold out ENTIRE CHROMOSOMES for val/test, never individual
-windows. No window in val/test ever shares a chromosome with any window
-in train.
+much better than the model actually generalizes.
 
 Usage:
     python make_windows.py \
@@ -90,9 +80,7 @@ def main() -> int:
         "val": set(args.val_chroms),
         "test": set(args.test_chroms),
     }
-    # Hard guard: refuse to write a manifest if any chromosome appears in more
-    # than one split. This is the exact bug class this file exists to prevent,
-    # so it gets checked explicitly rather than trusted to the CLI args.
+
     seen = {}
     for split_name, chrom_set in all_chrom_sets.items():
         for c in chrom_set:

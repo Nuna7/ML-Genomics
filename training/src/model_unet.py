@@ -3,27 +3,6 @@ model_unet.py
 -------------
 Architecture 2: 1D encoder (shared with CNN model conceptually) -> outer-product
 expansion -> small 2D UNet for multi-scale refinement.
-
-Why a UNet here specifically: Hi-C maps contain structure at very
-different physical scales simultaneously within the same window --
-sharp point-to-point loops (a handful of pixels), TAD boundaries (tens of
-pixels), and broad compartment-level background (the whole map). A plain
-stack of same-resolution convolutions (the CNN model) has to capture all
-of these with a fixed receptive field per layer. A UNet's encoder-decoder
-with downsampling/upsampling and skip connections lets different parts of
-the network specialize: deep/coarse layers naturally pick up large-scale
-compartment structure, shallow/skip-connected layers preserve sharp local
-detail (loop anchors) that would otherwise get blurred out by the
-downsampling path. This is the standard motivation for UNet in any
-dense-prediction task with multi-scale structure (its origin in biomedical
-image segmentation is the same argument: cell boundaries are
-fine-grained, tissue-level structure is coarse).
-
-This implementation keeps the 1D-to-2D expansion IDENTICAL to the CNN
-model (same outer-product-with-interactions construction) so that any
-performance difference we measure between the two models is attributable
-to the 2D refinement architecture, not to a confound from also changing
-how the 1D->2D bridge works.
 """
 from __future__ import annotations
 
@@ -120,6 +99,8 @@ class UNetHiCModel(nn.Module):
         self.dec0 = ConvBNAct(base * 2, base)      # base (skip) + base (up) -> base
 
         self.head = nn.Conv2d(base, 1, kernel_size=1)
+        nn.init.normal_(self.head.weight, mean=0.0, std=0.5)
+        nn.init.zeros_(self.head.bias)
 
     def forward(self, tracks: torch.Tensor) -> torch.Tensor:
         B, _, L = tracks.shape
@@ -150,5 +131,6 @@ class UNetHiCModel(nn.Module):
         d0 = self.dec0(torch.cat([d0, e0], dim=1))  # (B, base, L, L)
 
         out = self.head(d0).squeeze(1)    # (B, L, L)
+        out = F.softplus(out)             # non-negative, no saturation (see model_cnn.py)
         out = 0.5 * (out + out.transpose(1, 2))
         return out

@@ -1,0 +1,55 @@
+# encode_sources.yaml
+# -------------------
+#   K562:  ENCSR000CXJ (Rao 2014, in situ Hi-C, K562)
+#          Hi-C:  ENCFF291JZM  
+#          Loops: GSE63525 K562 HiCCUPS 
+#   HepG2: ENCSR194SRI (ENCODE, in situ Hi-C, HepG2, hg38)
+#          Hi-C:  ENCFF020DPP  
+#          Loops: ENCFF050EKS 
+
+cell_lines:
+  K562:
+    hic_url: https://www.encodeproject.org/files/ENCFF291JZM/@@download/ENCFF291JZM.hic
+    ctcf_url: https://www.encodeproject.org/files/ENCFF000YMA/@@download/ENCFF000YMA.bigWig
+    h3k27ac_url: https://www.encodeproject.org/files/ENCFF779QTH/@@download/ENCFF779QTH.bigWig
+    dnase_url: https://www.encodeproject.org/files/ENCFF414OGC/@@download/ENCFF414OGC.bigWig
+    loop_source: geo
+    loop_url: https://ftp.ncbi.nlm.nih.gov/geo/series/GSE63nnn/GSE63525/suppl/GSE63525%5FK562%5FHiCCUPS%5Flooplist%2Etxt%2Egz
+    loop_filename: GSE63525_K562_HiCCUPS_looplist.txt.gz
+
+  HepG2:
+    hic_url: https://www.encodeproject.org/files/ENCFF020DPP/@@download/ENCFF020DPP.hic
+    ctcf_url: https://www.encodeproject.org/files/ENCFF266BGZ/@@download/ENCFF266BGZ.bigWig
+    h3k27ac_url: https://www.encodeproject.org/files/ENCFF084DIM/@@download/ENCFF084DIM.bigWig
+    dnase_url: https://www.encodeproject.org/files/ENCFF938OBZ/@@download/ENCFF938OBZ.bigWig
+    loop_source: encode
+    loop_url: https://www.encodeproject.org/files/ENCFF050EKS/@@download/ENCFF050EKS.bedpe.gz
+    loop_filename: ENCFF050EKS.bedpe.gz
+
+liftover:
+  chain_filename: hg19ToHg38.over.chain.gz
+
+experiment:
+  bin_size: 1000
+  window_size: 100000
+  jitter: 20000
+  train_loops_per_cell_line: 100
+  test_loops_per_cell_line: 25
+  train_chroms: [chr1, chr2, chr3, chr8]
+  test_chroms: [chr17]
+  seed: 42
+
+training:
+  batch_size: 32
+  lr: 1e-3
+  weight_decay: 1e-5
+  epochs:
+    cnn: 60
+    unet: 60
+    transformer: 60
+  early_stopping_patience: 10
+  transformer_warmup_steps: 100
+  transformer_grad_clip_norm: 0.5
+  transformer_dropout: 0.3
+  transformer_weight_decay: 1e-3
+  transformer_lr: 1e-3

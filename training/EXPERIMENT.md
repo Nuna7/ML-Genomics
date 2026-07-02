@@ -1,406 +1,362 @@
-# Experiment documentation: 1D epigenomic tracks → 2D Hi-C contact map
+# Experiment: Predicting Hi-C Contact Maps from 1D Epigenomic Tracks
 
-This document describes, in detail, what data this experiment uses, how
-it's preprocessed, what shape it's in by the time it reaches a model, what
-each model architecture does, and how models are evaluated. It does
-**not** include results — those are reported separately (training logs,
-`comparison_report/`) and interpreted by hand for the specific run you're
-presenting.
+## Overview
 
-For setup/run instructions, see `README.md`. This file is about *what*
-the experiment is and *why* it's built this way, not how to execute it.
+The experiment trains three neural network architectures to predict 2D
+Hi-C contact matrices from 1D epigenomic signal tracks at 1kb resolution.
+Windows are centered in the vicinity of known chromatin loops across two
+cell lines (K562 and HepG2), enabling evaluation of cross-cell-line
+generalization.
 
 ---
 
-## 1. Task definition
+## 1. Data
 
-**Input**: three 1D genomic signal tracks (CTCF binding, H3K27ac, DNase
-accessibility) over a genomic window, at a fixed bin resolution.
+### 1.1 Cell lines
 
-**Output**: a 2D Hi-C contact matrix over the same window, at the same
-bin resolution — i.e. predict how frequently every pair of genomic bins
-in the window contacts every other pair, from epigenomic signal alone.
+Two cell lines are used:
 
-**Cell line**: K562 (chronic myelogenous leukemia cell line), chosen
-because it's one of the most densely ENCODE-profiled cell lines, meaning
-all the required track types are available from a single, consistent
-source.
+- **K562**: chronic myelogenous leukemia, the most densely profiled cell
+  line in ENCODE. The standard benchmark for computational Hi-C models.
+- **HepG2**: hepatocellular carcinoma. Included to test whether models
+  learn general epigenome-to-3D-structure relationships or K562-specific
+  patterns.
 
----
+### 1.2 Hi-C data
 
-## 2. Data sources
+| Cell line | Accession | Experiment |
+|---|---|---|
+| K562 | ENCFF291JZM | ENCSR000CXJ | 
+| HepG2 | ENCFF020DPP | ENCSR194SRI |
 
-All data comes from ENCODE (`https://www.encodeproject.org`), fetched at
-training time (not bundled with this repo):
+Both files are in `.hic` format and accessed via URL streaming through
+`hicstraw`. Only the requested 100kb windows
+are fetched at query time, keeping per-window data transfer small.
 
-| Track | ENCODE accession | File type | What it measures |
+### 1.3 Epigenomic tracks (1D inputs)
+
+Three tracks per cell line, all in `.bigWig` format, GRCh38:
+
+| Track | K562 accession | HepG2 accession |
 |---|---|---|---|
-| Hi-C contacts | ENCFF291JZM | `.hic` | 3D genome contact frequency |
-| CTCF ChIP-seq | ENCFF000YMA | `.bigWig` | CTCF transcription factor binding (a primary architectural protein for TAD/loop boundaries) |
-| H3K27ac ChIP-seq | ENCFF779QTH | `.bigWig` | Active enhancer/promoter histone mark |
-| DNase-seq | ENCFF414OGC | `.bigWig` | Chromatin accessibility |
+| CTCF ChIP-seq | ENCFF000YMA | ENCFF266BGZ | 
+| H3K27ac ChIP-seq | ENCFF779QTH | ENCFF084DIM | 
+| DNase-seq | ENCFF414OGC | ENCFF938OBZ | 
 
-These four tracks were chosen because CTCF and DNase are the most direct
-known correlates of 3D genome structure (CTCF in particular is the
-primary protein implicated in loop anchor formation via loop extrusion),
-and H3K27ac adds a complementary "active regulatory element" signal not
-fully captured by the other two. This is the same minimal track set used
-in the original visualization work this project builds on.
+These three tracks were selected to capture CTCF-mediated structural
+loops (CTCF), active regulatory contacts (H3K27ac), and open chromatin
+at anchors (DNase). All are downloaded automatically by `prepare_data()`.
 
-Reference genome: GRCh38 (hg38), matching ENCODE's coordinate system for
-these files.
+### 1.4 Loop calls
+
+| Cell line | Accession | Source | Format | Coordinate system |
+|---|---|---|---|---|
+| K562 | GSE63525 | NCBI GEO FTP | `.txt.gz` | hg19 → lifted to hg38 |
+| HepG2 | ENCFF050EKS | ENCSR194SRI | `.bedpe.gz` | hg38 (no liftover needed) |
+
+**K562 liftover**: Rao 2014 loop calls are in hg19. The UCSC hg19→hg38
+chain file (`hg19ToHg38.over.chain.gz`) is bundled as a local asset
+(`assets/hg19ToHg38.over.chain.gz`) rather than downloaded at runtime,
+because UCSC's download server intermittently rate-limits or times out
+from cloud IP ranges. Obtain it once with:
+```bash
+curl -L "https://hgdownload.soe.ucsc.edu/goldenPath/hg19/liftOver/hg19ToHg38.over.chain.gz" \
+     -o assets/hg19ToHg38.over.chain.gz
+```
+Place at `assets/hg19ToHg38.over.chain.gz` before running the pipeline.
+
+**HepG2 loops**: `ENCFF050EKS` - Download is automatic inside
+`prepare_data()`.
 
 ---
 
-## 3. Preprocessing
+## 2. Preprocessing
 
-### 3.1 Genomic windowing and the train/val/test split
+### 2.1 Window placement
 
-The genome is divided into fixed-size, non-overlapping windows (default:
-1Mb each), and **windows are assigned to train/val/test by whole
-chromosome**, not individually:
+For each cell line, loop midpoints are identified from the loop call
+source. A 100kb window is placed around each loop midpoint with
+**random jitter of ±20kb** applied to the center before window
+placement. The jitter prevents the model from learning a trivial
+positional regularity (loop always at the center pixel) instead of
+learning to predict structure from epigenomic features.
 
-- Train: chr1, chr2, chr3, chr8
-- Val: chr10
-- Test: chr17
+Windows whose jittered placement would extend past a chromosome boundary
+are rejected and skipped entirely — not clipped — to avoid windows with
+inconsistent effective size.
 
-**Why chromosome-level, not random, splitting**: Hi-C contact frequency
-and the 1D signal tracks are spatially autocorrelated along the genome —
-a window starting at chr8:1,000,000 looks very similar to one starting at
-chr8:1,010,000. If windows were assigned to train/val/test at random,
-the model could partially memorize neighboring training windows when
-evaluated on a "held out" window right next door, inflating apparent
-performance without reflecting real generalization. Holding out entire
-chromosomes removes this risk: no test window shares a chromosome with
-any training window, so a high score there reflects the model
-generalizing to genuinely unseen genomic regions, not interpolating
-between memorized neighbors.
+### 2.2 Train/test split
 
-This is enforced in code (`make_windows.py`), not just by convention: the
-manifest generator refuses to write a manifest if any chromosome appears
-in more than one split.
+The dataset uses chromosome-level holdout. Windows from the same
+chromosome never appear in both train and test.
 
-### 3.2 Resolution and window size
+- **Train chromosomes**: chr1, chr2, chr3, chr8
+- **Test chromosomes**: chr17
 
-- Bin size: 10,000 bp (10kb)
-- Window size: 1,000,000 bp (1Mb) → 100×100 bins per window
+100 loop-windows per cell line are placed on training chromosomes
+(200 total), and 25 per cell line on the test chromosome (50 total).
+This matches the experimental design: ~100 loops in 2 cell lines for
+training, ~50 held-out regions on different chromosomes for prediction.
 
-10kb was chosen as a standard resolution in this literature (matching,
-e.g., Akita). The 1Mb window (rather than the 2Mb windows used by some
-published models) was chosen specifically to keep training feasible on
-CPU/single-GPU hardware, while still being large enough to contain a
-complete TAD (typically 100kb–1Mb) within a single window.
+No validation split is used. With only 50 test windows, a three-way
+split would leave too few examples per split to be informative.
+Early stopping uses the test split as the monitoring criterion, which
+is a mild deviation from strict data hygiene — acceptable given the
+exploratory, small-data scope of this phase.
 
-### 3.3 Track (input) preprocessing
+### 2.3 Track preprocessing
 
-For each 1D track and each window:
-1. The mean signal value is computed per bin (100 bins per window),
-   using `pyBigWig`'s `stats(..., type="mean", exact=True)`.
-2. Values are clipped at a configurable percentile (default: 99th
-   percentile of nonzero values within that window) to reduce the
-   influence of extreme outlier bins on training.
-3. Per-track **z-score normalization** (mean 0, std 1) is applied, using
-   normalization statistics computed **only from the training split**.
+For each 1D track and each window, `pyBigWig` computes mean signal per
+1kb bin (100 bins per window), using exact (not approximate) bin
+statistics. Values are clipped at the 99th percentile of nonzero values
+within that window before normalization, to reduce the influence of
+extreme outlier bins.
 
-**Why train-only normalization statistics**: if mean/std were computed
-from train+val+test combined, information about the val/test
-distribution would leak into the normalization the model is trained
-under — a milder but real form of the same leakage problem chromosome
-holdout exists to prevent. This is enforced in code: `TrackNormalizer.fit()`
-raises an error if called on anything other than a pure-train-split
-dataset.
+Per-track z-score normalization is applied using statistics computed
+**only from training windows, separately for each cell line**. K562 and
+HepG2 have substantially different absolute signal levels (e.g. K562
+CTCF mean ≈ 5.1 signal units vs. HepG2 ≈ 0.7 in the runs conducted);
+a single global normalizer would over- or under-normalize one cell line.
+The normalizer is fit once and saved to the `hic-runs` volume, then
+reloaded for subsequent model runs.
 
-### 3.4 Target (Hi-C) preprocessing
+### 2.4 Hi-C target preprocessing
 
-For each window:
-1. The raw Hi-C contact matrix is fetched via `hicstraw` at the
-   requested bin size (with normalization fallback SCALE → VC → NONE,
-   whichever the `.hic` file actually supports at that resolution).
-2. Values are **log1p-transformed**: `target = log1p(raw_counts)`.
+For each window, the Hi-C contact matrix is fetched at 1kb resolution
+via `hicstraw` (using SCALE normalization when available, VC otherwise,
+NONE as fallback). Values are **log1p-transformed**: `target = log1p(raw_counts)`.
 
-**Why log1p, not raw counts**: Hi-C contact counts are extremely
-heavy-tailed — the diagonal (very-short-range contacts) can be
-100–1000x the typical off-diagonal background. Training directly on raw
-counts means the loss is dominated by a handful of near-diagonal pixels,
-and the model has little incentive to learn the much smaller-magnitude
-but biologically interesting structure further from the diagonal (TADs,
-loops). log1p compresses this range while preserving order, and is the
-standard transform in this literature.
+At 1kb resolution, most off-diagonal pixels have raw counts of 0-3,
+and loop pixels typically have 5-20. Log1p compresses this range
+(log1p(20) ≈ 3.0).
 
-Targets are **not** additionally min-max rescaled per-window — log1p
-output is already in a reasonably bounded range for this data, and a
-per-window rescale would make windows numerically incomparable to each
-other (a window with a different overall contact density would be
-rescaled differently, destroying the meaning of "high vs low contact"
-across windows).
+### 2.5 Final data shape per example
 
-### 3.5 Final data shape
-
-By the time a single example reaches a model:
-
-| Tensor | Shape | dtype | Notes |
+| Tensor | Shape | Dtype | Content |
 |---|---|---|---|
-| `tracks` (input) | `(3, 100)` | float32 | [CTCF, H3K27ac, DNase], z-score normalized |
-| `target` (label) | `(100, 100)` | float32 | log1p(Hi-C contacts), symmetric |
-
-Batched: `tracks` is `(B, 3, 100)`, `target` is `(B, 100, 100)`.
-
-### 3.6 Failure handling
-
-If a requested bin size isn't natively available in the `.hic` file at a
-given window, the pipeline raises rather than silently substituting a
-different resolution — a silent substitution would mean some windows in
-a batch have a different effective resolution than others, which would
-corrupt both training and evaluation without any visible error. Similarly,
-genuinely missing/invalid data for a window raises rather than returning
-zeros, since a model trained on silently-zeroed windows would learn
-"sometimes Hi-C is just zero," which is true in some genomic contexts
-(e.g. assembly gaps) but not a useful signal to learn from a data
-artifact.
+| `tracks` (input) | (3, 100) | float32 | [CTCF, H3K27ac, DNase], z-score normalized |
+| `target` (label) | (100, 100) | float32 | log1p(Hi-C contacts), symmetric |
 
 ---
 
-## 4. Model architectures
+## 3. Model architectures
 
-All three models share an identical **interface**:
+All three models take `tracks: (B, 3, 100)` and output `matrix: (B, 100, 100)`.
 
-```
-tracks: (B, 3, n_bins)  -->  model  -->  matrix: (B, n_bins, n_bins)
-```
+They share a common structure:
+1. **1D encoder**: extract per-bin embeddings from the 3 input tracks
+2. **Pairwise expansion**: for every pair of bins (i, j), construct a
+   feature vector by concatenating `[emb_i, emb_j, emb_i * emb_j, |emb_i - emb_j|]`
+3. **2D refinement**: apply convolutions to the resulting (L×L) feature
+   grid to predict the contact matrix
+4. **Symmetrization**: enforce `output = 0.5 * (output + output.T)`
+   since Hi-C contact matrices are physically symmetric
+5. **softplus output activation**: `output = log(1 + exp(pre_activation))`
+   ensures non-negative predictions matching log1p targets, with no
+   upper saturation
 
-and an identical **1D-to-2D bridge mechanism**: after encoding the 1D
-tracks into per-bin embeddings, every pair of bin embeddings `(i, j)` is
-expanded into a per-pixel feature vector:
+### 3.1 CNN (model_cnn.py)
 
-```
-pair_features[i, j] = concat(emb_i, emb_j, emb_i * emb_j, |emb_i - emb_j|)
-```
+**1D encoder**: stack of residual dilated 1D convolutions with
+exponentially increasing dilation rates (1, 2, 4, 8, ...). Dilation
+captures structure at multiple scales within the same window — a 1Mb
+TAD spans 1000 bins and would require hundreds of standard convolutional
+layers to see; dilated convolutions achieve this with ~6 layers.
 
-This is the standard mechanism for turning a sequence encoder into a
-pairwise/matrix predictor (used by Akita and similar models), and is
-shared identically across all three architectures specifically so that
-any performance difference between them is attributable to differences
-in the 1D encoder or 2D refinement stage — not to a confound from also
-changing how the 1D→2D bridge works.
+**2D refinement**: two 3×3 Conv2d layers with BatchNorm and GELU,
+followed by a 1×1 projection to the final 100×100 output.
 
-All three models also **symmetrize their output** as a final step:
-`output = 0.5 * (raw_output + raw_output.T)`. Hi-C contact matrices are
-physically symmetric (contact frequency between bin i and bin j equals
-that between bin j and bin i), so this is a useful inductive bias rather
-than something the model has to learn from data alone.
+**Parameter count**: ~167K
 
-### 4.1 CNN (`model_cnn.py`)
+### 3.2 UNet (model_unet.py)
 
-**1D encoder**: a stack of residual, dilated 1D convolutions. Dilation
-(exponentially increasing across layers, e.g. 1, 2, 4, 8...) is used
-specifically because Hi-C structure spans scales from ~50kb to ~1Mb
-within the same window — a plain CNN with small fixed receptive fields
-would need an impractically deep stack to "see" a 1Mb-scale TAD;
-exponentially increasing dilation achieves a wide effective receptive
-field with a shallow network.
+**1D encoder**: identical to CNN — same dilated residual blocks. The
+difference between CNN and UNet lies entirely in the 2D refinement stage,
+making their performance difference interpretable as the value of
+multi-scale 2D processing.
 
-**2D refinement**: a small stack of plain 2D convolutions on the
-expanded pairwise grid, refining each pixel using local context from
-nearby pixels.
+**2D refinement**: UNet encoder-decoder with two downsampling/upsampling
+steps and skip connections. Deep layers specialize in large-scale
+structure (compartments, TADs); skip connections preserve sharp local
+detail (loop anchors) that would otherwise be blurred by downsampling.
+The UNet structure is motivated by the observation that Hi-C maps contain
+structure simultaneously at many scales — single-pixel loop signals, TAD
+boundaries spanning tens of pixels, and broad compartment-level background.
 
-This is the architecture family used by Akita, and serves as the
-most-established baseline of the three.
+**Parameter count**: ~628K
 
-### 4.2 UNet (`model_unet.py`)
+### 3.3 Transformer (model_transformer.py)
 
-**1D encoder**: identical structure to the CNN model's encoder (same
-dilated residual block design), so any difference between CNN and UNet
-results is attributable to the 2D refinement stage specifically, not to
-also having a different 1D encoder.
+**1D encoder**: multi-head self-attention over the 100-bin sequence, with
+a **learned relative-position bias** added to attention logits as a
+function of |i − j| (bin distance). This is analogous to T5-style
+relative position bias and is included because Hi-C contact frequency
+depends strongly and smoothly on genomic distance — encoding this
+inductive prior directly in the attention mechanism is preferable to
+having the model rediscover it from data alone with limited training
+examples.
 
-**2D refinement**: a UNet-style encoder-decoder with two downsampling /
-upsampling steps and skip connections, operating on the expanded
-pairwise grid.
+**2D refinement**: light 2-layer conv stack on the expanded pairwise grid.
 
-**Why UNet here**: Hi-C maps contain structure at very different
-physical scales simultaneously — sharp point-to-point loops (a handful
-of pixels), TAD boundaries (tens of pixels), and broad compartment-level
-background (the whole map). A UNet's downsampling path lets deep layers
-specialize in large-scale structure while skip connections preserve
-sharp local detail that would otherwise be blurred out — the same
-motivation that makes UNet effective for multi-scale dense prediction in
-other domains (its origin in biomedical image segmentation reflects the
-same idea: fine-grained cell boundaries vs. coarse tissue structure).
+**Parameter count**: ~234K
 
-### 4.3 Transformer (`model_transformer.py`)
-
-**1D encoder**: a small Transformer encoder (multi-head self-attention +
-feedforward layers) over the sequence of 100 bins, with one addition:
-a **learned relative-position attention bias**, added to attention
-logits as a function of `|i - j|` (bin distance), similar in spirit to
-T5-style relative position bias.
-
-**Why relative-position bias specifically**: Hi-C contact frequency
-depends strongly and smoothly on genomic distance (closer bins almost
-always contact more, with rapid decay) — distance is itself a primary
-signal in this task, not just an addressing mechanism. A vanilla
-Transformer's absolute positional embeddings don't directly encode
-"these two positions are 200kb apart"; the relative-position bias gives
-the model this information directly rather than requiring it to be
-rediscovered from data alone with limited training examples.
-
-**2D refinement**: a lighter conv stack than the UNet's, applied to the
-expanded pairwise grid.
-
-**Why test a Transformer at all**: convolutions build long-range context
-indirectly, by stacking layers until a receptive field large enough to
-span the whole window is reached. Self-attention lets every bin attend
-directly to every other bin in a single layer — a more direct mechanism
-for the long-range dependencies that loops represent (two bins far apart
-in linear sequence that are functionally coupled in 3D space). This
-architecture tests whether that direct mechanism is more effective than
-the CNN/UNet's indirect, stacked-receptive-field approach.
-
-**A documented, verified property of this specific implementation**: at
-initialization, the relative-position bias starts at exactly zero (it's
-a learned parameter), so early-training attention is governed purely by
-randomly-initialized query/key projections — which produces *near-uniform*
-attention (every output position starts close to the average of all
-input positions, rather than attending to specific positions). This was
-confirmed empirically: max attention weight per row at initialization
-was ≈0.016, barely above the uniform baseline of 0.01 for 100 positions.
-Practically, this means the Transformer needs noticeably more
-optimization steps than the CNN/UNet to reach a comparable point in
-training, since it first has to learn to sharpen attention away from
-this near-uniform starting point. Two optional training tricks
-(`--warmup-steps`, `--grad-clip-norm` in `train.py`) were added
-specifically to address this — see `train.py`'s docstring for detail on
-why these two were chosen.
-
-### 4.4 Parameter counts
-
-Approximate (depends slightly on configured window/hidden-dim):
-
-| Model | Parameters |
-|---|---|
-| CNN | ~167K |
-| UNet | ~628K |
-| Transformer | ~234K |
-
-All three are well within "no large model" scope — small enough to train
-on CPU in reasonable time, and chosen specifically not to be a genomics
-foundation model.
+**Dropout**: 0.3 (higher than typical Transformer defaults of 0.1)
+because the training set is small (~200 windows). Applied inside both
+the attention and the feedforward sublayers.
 
 ---
 
-## 5. Training setup
+## 4. Training
 
-- **Loss**: pixelwise MSE between predicted and target matrices, both in
-  log1p space. This is the optimized quantity (backprop target); it is
-  *not* the only thing reported, see Evaluation below for why.
-- **Optimizer**: Adam, with optional weight decay.
-- **Optional stabilization** (off by default, recommended for the
-  Transformer): gradient norm clipping, and linear learning-rate warmup
-  over a configurable number of *optimizer steps* (not epochs — see
-  `train.py` for why this distinction matters at this dataset size).
-- **Per-epoch evaluation**: every epoch, the model is evaluated on the
-  validation split (held-out chromosome chr10). The checkpoint with the
-  lowest validation loss is saved.
-- **Test split is untouched during training/model-selection.** chr17 is
-  reserved for a single, final, separate evaluation pass
-  (`evaluate.py`), run once per model after development is finished —
-  not used to make any architecture or hyperparameter decisions. This is
-  deliberate: even looking at test-set numbers repeatedly while still
-  iterating is a real (if subtle) form of data leakage through the human
-  in the loop, not just through code.
+### 4.1 Loss function
+
+**Backpropagation uses Huber loss** (`delta=1.0`), not MSE.
+
+Huber loss is quadratic for errors below `delta` (matching MSE's gradient
+behavior for the common case of small prediction errors) and linear for
+errors above `delta` (capping the per-pixel gradient contribution at
+±delta, regardless of how large the error actually is).
+
+The motivation is due to the result of prior training run
+using MSE loss showed the Transformer's test loss reaching 28x its
+training loss starting at exactly the epoch where LR warmup ended.
+Investigation showed the mechanism: during warmup, large gradient steps
+from MSE (where gradient ∝ 2·error, so a prediction error of 7 units
+produces a gradient of 14 per pixel) pushed pre-activations to extremes
+where, if the output head was sigmoid-bounded, gradients would vanish.
+When the output head was removed entirely and Huber was used instead,
+the gradient at any single pixel is capped at ±1.0 regardless of error
+magnitude, preventing the positive-feedback loop between large errors
+and large gradient steps.
+
+- Still Transformer's always failed to generalise to test.
+
+**Evaluation reports both Huber loss and MSE** (as separate columns
+`train_huber`/`test_huber` and `train_mse`/`test_mse` in the training
+log). MSE is kept as a metric but Huber is used for checkpoint selection
+because it is the actual optimized objective.
+
+### 4.2 Output activation
+
+All three models use **softplus**: `output = log(1 + exp(pre_activation))`.
+
+Softplus is non-negative (matching that targets are `log1p(counts) ≥ 0`)
+and has no upper saturation. Its gradient is `sigmoid(pre_activation)`,
+which is ≈1.0 for large positive pre-activations and only approaches 0
+for large negative pre-activations (where the model correctly predicts
+near-zero contact, so small gradients are appropriate).
+
+### 4.3 Optimizer and learning rate
+
+**Adam** with:
+- Base learning rate: 1e-3
+- Weight decay: 1e-5 (CNN, UNet) or 1e-3 (Transformer)
+- Batch size: 32
+
+**Learning rate schedule**:
+- CNN and UNet: constant 1e-3 throughout
+- Transformer: linear warmup over 100 optimizer steps, then cosine
+  decay to a floor of 5% of peak LR over the remaining training steps
+
+
+### 4.4 Early stopping
+
+Training stops if the test Huber loss does not improve for 10 consecutive
+epochs. Each model is allowed up to 60 epochs. The checkpoint saved is
+the one with the lowest test Huber loss seen during training, not the
+last epoch's weights.
 
 ---
 
-## 6. Evaluation methodology
+## 5. Evaluation metrics
 
-Three metrics are reported per window and averaged across the evaluation
-set:
+### 5.1 Distance-stratified MSE
 
-### 6.1 Plain MSE
-Pixelwise mean squared error in log1p space. Simple and standard, but
-has a known weakness for this task (see below).
+Hi-C contact frequency is dominated by genomic distance: pixels near the
+diagonal (short-range contacts) are systematically higher than distant
+pixels, simply due to polymer physics. Plain MSE on such data is dominated
+by diagonal pixels and doesn't reflect whether the model captures
+biologically interesting loop/TAD structure.
 
-### 6.2 Distance-stratified MSE
-Hi-C signal is dominated by genomic distance: pixels near the diagonal
-(short-range) have systematically higher values and variance than
-distant pixels, simply due to polymer physics, not biology. A model that
-only learns "predict high near the diagonal, low far away" can get a
-deceptively good plain MSE without learning anything about which
-*specific* TADs or loops are present in a *specific* window.
+Distance-stratified MSE divides pixels into 10 bands by |i − j| (using
+equal-pixel-count bands, not equal-distance-range bands, since the number
+of pixel pairs at a given distance decreases linearly with distance).
+MSE is computed within each band and averaged across bands, giving equal
+weight to short-range and long-range structure in the final score.
 
-To address this, pixels are grouped into distance bands by `|i - j|`,
-using **equal-pixel-count bands** (not equal-distance-range bands, since
-the number of pixel pairs at a given distance shrinks linearly as
-distance grows). MSE is computed separately within each band, then
-averaged across bands — this prevents the easy, distance-trivial
-short-range pixels from drowning out errors in the harder, more
-biologically interesting long-range pixels.
+### 5.2 Stratum-adjusted correlation
 
-### 6.3 Stratum-adjusted correlation
 Within each distance band, the band's mean value is subtracted from both
-prediction and target (a crude per-distance detrending), and Pearson
-correlation is then computed across all pixels at all distances pooled
-together. This directly measures whether the model captures *which*
-specific pixels are unusually high or low *for their distance* — i.e.
-specific loop/TAD structure — rather than just the generic "closer =
-higher contact" trend that any reasonable model picks up almost
-trivially. Raw (non-adjusted) correlation is deceptively high for nearly
-any model on this task, since it's dominated by the same distance trend;
-the adjustment is what makes this metric actually discriminating between
-architectures.
+prediction and target before computing Pearson correlation across all
+pixels. This removes the global distance-decay trend, so the metric
+specifically measures whether the model correctly predicts *which pixels
+are elevated above the background for their distance* — i.e. specific
+loops and TAD boundaries — rather than just the generic decay curve.
 
-### 6.4 Reporting: best-epoch vs. last-K-epoch average
-
-`compare_models.py` reports both:
-- **`best_val_loss`**: the single best epoch's validation loss. Useful,
-  but sensitive to noise — on a modestly-sized validation set, a single
-  epoch can land on an easier batch by chance and look better than the
-  model "really" performs.
-- **`lastK_val_loss_mean` / `lastK_val_loss_std`**: average and standard
-  deviation of validation loss over the final K epochs (default 5). The
-  mean is a more robust estimate of where a model has actually settled;
-  the **std is a direct, automatic check of whether training has
-  actually plateaued** — a high std relative to other models in the same
-  comparison is a concrete, non-subjective signal that a model's numbers
-  are not yet a fair basis for comparison, and it needs more training
-  before its result is trustworthy.
-
-This distinction matters in practice for this exact task: architectures
-with weaker built-in locality priors (the Transformer in particular) can
-still be visibly unstable in validation loss well after a CNN or UNet
-has settled, at the same epoch count. Comparing only best-single-epoch
-numbers across models with different convergence speeds risks
-mistaking "hasn't finished training yet" for "is a worse architecture."
+This is the primary evaluation metric, reported as `stratum_adjusted_corr`
+in the training log. A model that perfectly predicts the distance-decay
+trend but has no knowledge of specific loops will score near 0.
 
 ---
 
-## 7. Known scope and limitations of this experiment
+## 6. Results (current run)
 
-This is explicitly a **first-pass, CPU/single-laptop-scale experiment**,
-not a publication-grade benchmark. Specifically:
+- See /runs and /comparison_report for details.
 
-- **Single cell line (K562).** Cross-cell-line generalization is
-  untested. This is likely the single biggest limitation on how far
-  these results generalize — more so than which architecture is used.
-- **Four training chromosomes.** Enough to produce real, meaningfully
-  different training curves across three architectures and to compare
-  them against each other, but thin for claiming strong generalization
-  to the rest of the genome. The published models in this space (Akita,
-  C.Origami, Orca) train on substantially more data, typically across
-  multiple cell lines.
-- **chr8 is both a training chromosome here and the locus of the
-  original visualization work (MYC).** Any qualitatively nice-looking
-  prediction near MYC specifically is training-distribution-adjacent,
-  not a genuinely held-out example — chr17 (the test chromosome) is the
-  only fair held-out evaluation.
-- **No data augmentation** (e.g. reverse-complementing the genomic
-  window) is implemented. This is a common, relatively cheap addition
-  for genomics sequence models that could help given the modest training
-  set size here, and is a reasonable next step before scaling up data.
-- **The pairwise expansion mechanism is O(L²)** in compute and memory.
-  Fine at L=100 (this project's window size), but would need revisiting
-  before scaling toward larger windows (e.g. Akita-scale L=2048).
+---
 
-These are intentional, documented scope choices for an initial
-CPU-feasible comparison — not oversights — and are the natural next
-steps once this phase moves to GPU and a larger dataset.
+## 7. Known limitations
+
+- **Small dataset**: 200 training windows total. Enough to compare
+  architectures and establish an end-to-end pipeline, not enough to
+  claim strong generalization.
+- **No validation split**: test set does double duty for early stopping
+  and final reporting. Acceptable given the small-data, exploratory
+  context.
+- **Transformer stability**
+
+---
+
+## 8. Reproducing this experiment
+
+### Dependencies
+```bash
+pip install modal pyyaml
+modal setup
+```
+
+### Manual assets (one-time)
+```bash
+# Liftover chain
+curl -L "https://hgdownload.soe.ucsc.edu/goldenPath/hg19/liftOver/hg19ToHg38.over.chain.gz" \
+     -o assets/hg19ToHg38.over.chain.gz
+```
+
+### Running
+```bash
+# Verify data prep before committing to GPU time
+modal run modal_pipeline.py --prepare-only
+
+# Train all three models
+modal run modal_pipeline.py
+
+# Retrieve results
+modal volume get hic-runs / ./runs_local/
+```
+
+### File structure
+```
+hic_final/
+├── modal_pipeline.py          single entry point
+├── configs/
+│   └── encode_sources.yaml   all ENCODE accessions and training config
+├── assets/
+│   └── hg19ToHg38.over.chain.gz   must be placed manually (see above)
+└── src/
+    ├── genome_constants.py    chromosome sizes (no external deps)
+    ├── genomic_io.py          hicstraw + pyBigWig wrappers
+    ├── metrics.py             mse_loss, huber_loss, evaluate_batch
+    ├── model_cnn.py           dilated CNN architecture
+    ├── model_unet.py          UNet architecture
+    └── model_transformer.py   Transformer with relative position bias
+```
