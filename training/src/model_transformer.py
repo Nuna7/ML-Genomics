@@ -4,6 +4,35 @@ model_transformer.py
 Architecture 3: Transformer encoder over the 1D bin sequence (with a
 relative-position attention bias) -> same outer-product expansion as the
 other two models -> light 2D refinement.
+
+Why a Transformer here specifically: convolutions (dilated or not) build
+long-range context indirectly, by stacking layers so information from
+distant bins eventually reaches a shared receptive field. Self-attention
+lets every bin attend directly to every other bin in a single layer,
+which is a more direct mechanism for capturing long-range dependencies --
+and Hi-C loops are exactly that: two bins far apart in linear genomic
+distance (tens to hundreds of kb) that are functionally coupled. The
+hypothesis this architecture tests is whether direct pairwise attention
+over the 1D tracks captures loop-relevant long-range dependencies more
+efficiently (in terms of parameters/data) than a dilated CNN does.
+
+One adaptation that matters for genomics specifically: a vanilla
+Transformer's learned/sinusoidal positional embeddings only tell the
+model "this is position 37," not "these two positions are 200kb apart
+along the genome." Hi-C contact frequency depends strongly and smoothly
+on genomic DISTANCE (closer bins almost always contact more, with rapid
+decay), so the relative distance between bins is itself a primary signal,
+not just an addressing mechanism. This implementation adds a learned bias
+term to attention scores based on |i - j| (relative bin distance),
+similar in spirit to T5-style relative position bias, instead of relying
+purely on absolute positional embeddings to let the model rediscover that
+"genomic distance matters" from scratch with limited training data.
+
+Because of the O(L^2) cost of attention and the O(L^2) memory of the
+output matrix itself, this is kept to a SINGLE transformer encoder
+(few layers, modest dim) appropriate for the "no large model" /
+CPU-or-single-GPU constraint -- this is intentionally not a
+genomics foundation model.
 """
 from __future__ import annotations
 
@@ -96,9 +125,6 @@ class TransformerHiCModel(nn.Module):
         self.n_bins = n_bins
 
         self.input_proj = nn.Linear(n_tracks, dim)
-        self.pos_embed = nn.Parameter(
-            torch.randn(1, n_bins, dim) * 0.02
-        )
         self.layers = nn.ModuleList(
             [
                 RelPosTransformerLayer(dim, n_heads, n_bins, ff_mult, dropout)
@@ -106,6 +132,8 @@ class TransformerHiCModel(nn.Module):
             ]
         )
         self.final_norm = nn.LayerNorm(dim)
+
+        # same outer-product-with-interactions expansion as the other two models
         pair_dim = dim * 4
         self.pair_refine = nn.Sequential(
             nn.Conv2d(pair_dim, refine_hidden, kernel_size=1),
@@ -128,7 +156,6 @@ class TransformerHiCModel(nn.Module):
 
         x = tracks.transpose(1, 2)        # (B, L, n_tracks)
         x = self.input_proj(x)            # (B, L, dim)
-        x = x + self.pos_embed
         for layer in self.layers:
             x = layer(x)
         x = self.final_norm(x)            # (B, L, dim)
@@ -141,6 +168,8 @@ class TransformerHiCModel(nn.Module):
         pair = pair.permute(0, 3, 1, 2)   # (B, 4*dim, L, L) for Conv2d
 
         out = self.pair_refine(pair).squeeze(1)   # (B, L, L)
-        out = torch.nn.functional.softplus(out)
+        # Linear output (no activation): predicts O/E deviations (signed).
+        # History: tried sigmoid*7 then softplus; both removed when switching
+        # to O/E targets which require signed outputs (mean ~0 per distance band).
         out = 0.5 * (out + out.transpose(1, 2))
         return out

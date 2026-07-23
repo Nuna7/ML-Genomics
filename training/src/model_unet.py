@@ -1,9 +1,3 @@
-"""
-model_unet.py
--------------
-Architecture 2: 1D encoder (shared with CNN model conceptually) -> outer-product
-expansion -> small 2D UNet for multi-scale refinement.
-"""
 from __future__ import annotations
 
 import torch
@@ -131,6 +125,5 @@ class UNetHiCModel(nn.Module):
         d0 = self.dec0(torch.cat([d0, e0], dim=1))  # (B, base, L, L)
 
         out = self.head(d0).squeeze(1)    # (B, L, L)
-        out = F.softplus(out)             # non-negative, no saturation (see model_cnn.py)
         out = 0.5 * (out + out.transpose(1, 2))
         return out

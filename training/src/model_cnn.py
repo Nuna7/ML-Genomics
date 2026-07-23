@@ -2,6 +2,41 @@
 model_cnn.py
 ------------
 Architecture 1: Dilated 1D CNN encoder -> outer-product expansion -> 2D conv refinement.
+
+This is the architecture family used by Akita (Fudenberg et al.) and is
+the most established approach for this exact task, so it's a sensible
+baseline to measure the other two against.
+
+The core idea, in three steps:
+
+1. ENCODE the 1D tracks with a stack of dilated 1D convolutions. Dilation
+   (not just stride/pooling) is used specifically because Hi-C structure
+   (TADs, loops) operates at scales from ~50kb to ~1Mb, i.e. spanning 2+
+   orders of magnitude in the same window. A plain CNN with small fixed
+   receptive fields would need an impractically deep stack to "see" a
+   1Mb-scale TAD; exponentially increasing dilation gets a wide effective
+   receptive field with a shallow network.
+
+2. EXPAND from 1D (length L) to 2D (L x L) via an outer-product-style
+   construction: for every pair of bin embeddings (i, j), concatenate
+   them (and add their elementwise product and absolute difference as
+   extra features) to form a per-pixel feature vector. This is the
+   standard trick for turning a sequence encoder into a pairwise/matrix
+   predictor -- it's essentially what Akita and most "1D track -> 2D
+   contact map" models do, instead of trying to learn a fully connected
+   layer from L features to L*L outputs (which would have a parameter
+   count that's quadratic in sequence length and wouldn't share weights
+   across genomic distance the way Hi-C structure does).
+
+3. REFINE with a small stack of 2D convolutions on the expanded grid, to
+   let the model smooth/sharpen local pixel neighborhoods using context
+   from nearby pixels, not just the two original 1D positions.
+
+4. SYMMETRIZE the output (0.5 * (M + M^T)). Hi-C contact matrices are
+   physically symmetric (contact frequency between bin i and bin j is the
+   same as between bin j and bin i), and explicitly enforcing this is a
+   useful inductive bias rather than hoping the network learns it from
+   data alone with limited training examples.
 """
 from __future__ import annotations
 
@@ -86,6 +121,9 @@ class CNNHiCModel(nn.Module):
         )  # (B, 4H, L, L)
 
         out = self.pair_refine(pair).squeeze(1)     # (B, L, L)
-        out = torch.nn.functional.softplus(out)
+        # Linear output (no activation): targets are O/E deviations (signed,
+        # mean ~0 per distance band, range ~[-1.5, +2.5]). A non-negative
+        # activation like softplus would be wrong here since O/E values can
+        # and should be negative (below-average contact at a given distance).
         out = 0.5 * (out + out.transpose(1, 2))      # enforce symmetry
         return out
