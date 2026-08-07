@@ -24,7 +24,7 @@ experiment:
   bin_size: 5000          # 5kb — confirmed usable by diagnose_resolution.py
   window_size: 500000     # 500kb window -> 100x100 output at 5kb
   jitter: 50000           # ±50kb jitter (10% of window, was ±20kb at 1kb)
-  train_loops_per_cell_line: 100
+  train_loops_per_cell_line: 1000
   test_loops_per_cell_line: 25
   train_chroms: [chr1, chr2, chr3, chr8]
   test_chroms: [chr17]
@@ -35,11 +35,11 @@ training:
   lr: 1e-3
   weight_decay: 1e-5
   epochs:
-    cnn: 60
-    unet: 60
-    transformer: 60
+    cnn: 100
+    unet: 100
+    transformer: 100
   early_stopping_patience: 10
-  transformer_warmup_steps: 100
+  transformer_warmup_steps: 600
   transformer_grad_clip_norm: 0.5
   transformer_dropout: 0.3
   transformer_weight_decay: 1e-3

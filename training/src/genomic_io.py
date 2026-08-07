@@ -12,6 +12,31 @@ from typing import Tuple
 import numpy as np
 import requests
 
+_HICFILE_CACHE: dict = {}
+_HICFILE_CALL_COUNT: dict = {}
+_HICFILE_MAX_CALLS = 50
+
+def _get_hicfile(hic_source: str):
+    import hicstraw
+    count = _HICFILE_CALL_COUNT.get(hic_source, 0)
+    if hic_source not in _HICFILE_CACHE or count >= _HICFILE_MAX_CALLS:
+        _HICFILE_CACHE[hic_source] = hicstraw.HiCFile(hic_source)
+        _HICFILE_CALL_COUNT[hic_source] = 0
+    _HICFILE_CALL_COUNT[hic_source] += 1
+    return _HICFILE_CACHE[hic_source]
+ 
+ 
+def _looks_like_missing_norm(exc: Exception) -> bool:
+    """Only these error shapes indicate 'this normalization vector isn't
+    computed for this file/resolution' -- genuinely safe to fall back on.
+    Anything else (bad_alloc, network errors, etc.) is a real failure that
+    falling back to a different normalization will NOT fix."""
+    msg = str(exc).lower()
+    return (
+        "did not contain" in msg
+        or "normalization" in msg and "not" in msg
+        or "no such" in msg
+    )
 
 def download_file(url: str, out_path: Path, chunk_mb: int = 8, max_retries: int = 8) -> Path:
     """Resumable download with retry, identical behavior to the viz script."""
@@ -58,33 +83,21 @@ def hic_matrix(
     start: int,
     end: int,
     bin_size: int,
+    normalization_preference: tuple = ("SCALE", "VC_SQRT", "NONE"),
 ) -> Tuple[np.ndarray, int]:
-    """
-    Fetch a square Hi-C contact matrix for [start, end) at the given chrom,
-    using the same chromosome-name resolution and normalization fallback
-    as the visualization script.
-
-    Returns (matrix, actual_bin_size_used). actual_bin_size_used may differ
-    from the requested bin_size if the .hic file doesn't have that exact
-    zoom level cached -- the caller MUST check this and either accept it
-    or raise, never silently assume the requested size was honored.
-    """
     try:
         import hicstraw
     except ImportError as e:
         raise ImportError(
-            "hic_matrix() requires the 'hic-straw' package, which is not "
-            "installed. Install with: pip install hic-straw. (Note: this "
-            "requires libcurl development headers on the system, e.g. "
-            "`apt install libcurl4-openssl-dev` on Debian/Ubuntu, since "
-            "hic-straw compiles a C++ extension.)"
+            "hic_matrix() requires the 'hic-straw' package. "
+            "Install with: pip install hic-straw."
         ) from e
-
-    hf = hicstraw.HiCFile(hic_source)
+ 
+    hf = _get_hicfile(hic_source)   # <-- reused across calls, not reopened
     avail_res = hf.getResolutions()
     best = max((r for r in avail_res if r <= bin_size), default=min(avail_res))
     bin_size_used = best
-
+ 
     names = [c.name for c in hf.getChromosomes()]
     key = chrom
     if key not in names:
@@ -97,23 +110,49 @@ def hic_matrix(
             raise ValueError(
                 f"Chromosome '{chrom}' not found in Hi-C file. Available: {names}"
             )
-
+ 
     n = max(1, int(np.ceil((end - start) / bin_size_used)))
-
-    mzd = hf.getMatrixZoomData(
-        key,
-        key,
-        "observed",
-        "NONE",
-        "BP",
-        bin_size_used,
-    )
-    raw = mzd.getRecordsAsMatrix(start, end, start, end)
-
+ 
+    mzd = None
+    norm_used = None
+    last_err = None
+    for norm in normalization_preference:
+        try:
+            mzd_try = hf.getMatrixZoomData(key, key, "observed", norm, "BP", bin_size_used)
+            raw_try = mzd_try.getRecordsAsMatrix(start, end, start, end)
+            if raw_try.size == 0 or not np.isfinite(raw_try).any():
+                raise ValueError(f"'{norm}' returned empty/non-finite matrix")
+            mzd, raw, norm_used = mzd_try, raw_try, norm
+            break
+        except Exception as e:
+            if not _looks_like_missing_norm(e):
+                # Real failure (memory, network, corrupt state) -- don't
+                # burn through the remaining normalizations pretending
+                # this is a "not available" case. Surface it immediately.
+                raise RuntimeError(
+                    f"hic_matrix() failed on {chrom}:{start}-{end} while "
+                    f"requesting '{norm}' -- this does not look like a "
+                    f"missing-normalization error, so not falling back. "
+                    f"Original error: {type(e).__name__}: {e}"
+                ) from e
+            last_err = e
+            continue
+ 
+    if mzd is None:
+        raise RuntimeError(
+            f"No usable normalization found for {hic_source} at {chrom}:{start}-{end} "
+            f"(tried {normalization_preference}). Last error: {last_err}"
+        )
+ 
+    if norm_used != normalization_preference[0]:
+        print(f"  [WARN] {chrom}:{start}-{end}: '{normalization_preference[0]}' "
+              f"unavailable, fell back to '{norm_used}'.")
+ 
     mat = np.zeros((n, n), dtype=np.float32)
     r0 = min(raw.shape[0], n)
     c0 = min(raw.shape[1], n)
     mat[:r0, :c0] = raw[:r0, :c0]
+    mat = np.nan_to_num(mat, nan=0.0)
     return mat, bin_size_used
 
 def read_bigwig(

@@ -96,6 +96,7 @@ def prepare_data():
         download_file(cl_cfg["h3k27ac_url"], raw / f"{cl_name}_h3k27ac.bigWig")
         download_file(cl_cfg["dnase_url"],   raw / f"{cl_name}_dnase.bigWig")
         download_file(cl_cfg["loop_url"],    raw / cl_cfg["loop_filename"])
+        download_file(cl_cfg["hic_url"],     raw / f"{cl_name}.hic")
         print(f"[prepare] {cl_name}: done.")
 
     def parse_hiccups_gz(gz_path):
@@ -221,7 +222,7 @@ def prepare_data():
 @app.function(image=image, gpu="A10G",
               volumes={VOLUME_DATA: vol_data, VOLUME_CACHE: vol_cache,
                        VOLUME_RUNS: vol_runs},
-              timeout=60*60*6, cpu=4, memory=16384)
+              timeout=60*60*6, cpu=4, memory=65536)
 def train_model(model_name: str) -> dict:
     import csv, json, time
     import numpy as np
@@ -251,10 +252,10 @@ def train_model(model_name: str) -> dict:
 
         def _paths(self, cl):
             return {
-                "ctcf":    raw / f"{cl}_ctcf.bigWig",
-                "h3k27ac": raw / f"{cl}_h3k27ac.bigWig",
-                "dnase":   raw / f"{cl}_dnase.bigWig",
-                "hic":     cfg["cell_lines"][cl]["hic_url"],
+                "ctcf": str(raw / f"{cl}_ctcf.bigWig"),
+                "h3k27ac": str(raw / f"{cl}_h3k27ac.bigWig"),
+                "dnase": str(raw / f"{cl}_dnase.bigWig"),
+                "hic": str(raw / f"{cl}.hic"),
             }
 
         def _cache(self, row):
@@ -333,43 +334,6 @@ def train_model(model_name: str) -> dict:
     run_dir.mkdir(parents=True, exist_ok=True)
     cache_dir = VOLUME_CACHE / "windows"
 
-    # ── Normalizer (fit on train only, per cell line) ─────────────────────
-    # norm_path  = VOLUME_RUNS / "normalizer.json"
-    # config_cls = set(cfg["cell_lines"].keys())
-    # need_refit = True
-    # if norm_path.exists():
-    #     with open(norm_path) as f: normalizer = json.load(f)
-    #     if set(normalizer.keys()) == config_cls:
-    #         need_refit = False
-    #         print(f"[train] Loaded normalizer for {config_cls}.")
-    #     else:
-    #         print(f"[train] Normalizer covers {set(normalizer.keys())}, "
-    #               f"need {config_cls}. Refitting.")
-
-    # if need_refit:
-    #     import pandas as pd
-    #     raw_ds = LoopDataset(manifest, "train", normalizer=None, cache_dir=cache_dir)
-    #     tm = pd.read_csv(manifest)
-    #     tm = tm[tm["split"] == "train"]
-    #     normalizer = {}
-    #     for cl in tm["cell_line"].unique():
-    #         idxs   = tm[tm["cell_line"] == cl].index.tolist()
-    #         n_s    = min(80, len(idxs))
-    #         sample = np.linspace(0, len(idxs)-1, n_s).astype(int)
-    #         sums   = np.zeros(3); sq_sums = np.zeros(3); count = 0
-    #         for i in sample:
-    #             t = raw_ds.get_tracks(idxs[i])
-    #             sums    += t.sum(axis=1)
-    #             sq_sums += (t**2).sum(axis=1)
-    #             count   += t.shape[1]
-    #         mean = sums / count
-    #         std  = np.sqrt(np.clip(sq_sums/count - mean**2, 1e-8, None))
-    #         normalizer[cl] = {"mean": mean.tolist(), "std": std.tolist()}
-    #         print(f"  {cl}: CTCF_mean={mean[0]:.3f} "
-    #               f"H3K27ac_mean={mean[1]:.3f} DNase_mean={mean[2]:.3f}")
-    #     with open(norm_path, "w") as f: json.dump(normalizer, f, indent=2)
-    #     vol_runs.commit()
-
     norm_path = VOLUME_RUNS / "normalizer.json"
     config_cls = set(cfg["cell_lines"].keys())
     need_refit = True
@@ -421,9 +385,9 @@ def train_model(model_name: str) -> dict:
 
     bs = tr_cfg["batch_size"]
     train_loader = DataLoader(train_ds, batch_size=bs, shuffle=True,
-                              num_workers=2, pin_memory=True)
+                              num_workers=0, pin_memory=True)
     test_loader  = DataLoader(test_ds,  batch_size=bs, shuffle=False,
-                              num_workers=2, pin_memory=True)
+                              num_workers=0, pin_memory=True)
     n_bins = int(train_ds.manifest["n_bins"].iloc[0])
 
     # ── Model ─────────────────────────────────────────────────────────────
@@ -571,8 +535,9 @@ def train_model(model_name: str) -> dict:
     # Per-cell-line breakdown on best checkpoint
     ckpt = torch.load(ckpt_path, map_location=device, weights_only=False)
     model.load_state_dict(ckpt["model_state_dict"]); model.eval()
-    per_cl = {cl: {"hub": 0., "corr": 0., "n": 0}
+    per_cl = {cl: {"hub": 0., "corr": 0., "corr_n": 0, "n": 0}
                for cl in cfg["cell_lines"]}
+    nan_windows = {cl: [] for cl in cfg["cell_lines"]}  # for locus reporting
     with torch.no_grad():
         for batch in test_loader:
             tracks = batch["tracks"].to(device, non_blocking=True)
@@ -582,22 +547,36 @@ def train_model(model_name: str) -> dict:
                 cl = batch["cell_line"][i]
                 if cl not in per_cl: continue
                 m = evaluate_batch(pred[i:i+1], target[i:i+1])
-                per_cl[cl]["hub"]  += huber_loss(
+                per_cl[cl]["hub"] += huber_loss(
                     pred[i:i+1], target[i:i+1], delta=0.5).item()
-                per_cl[cl]["corr"] += m["stratum_adjusted_corr"]
-                per_cl[cl]["n"]    += 1
+                per_cl[cl]["n"]   += 1
+                corr_val = m["stratum_adjusted_corr"]
+                if np.isnan(corr_val):
+                    # Record which window degenerated instead of silently
+                    # poisoning the running average. chrom/start/end aren't
+                    # in `batch` by default -- see note below to add them.
+                    nan_windows[cl].append(i)
+                else:
+                    per_cl[cl]["corr"]    += corr_val
+                    per_cl[cl]["corr_n"]  += 1
 
     cl_results = {}
     print(f"\n  Per-cell-line (best checkpoint, epoch {ckpt['epoch']}):")
     for cl, v in per_cl.items():
         n = max(1, v["n"])
+        corr_n = v["corr_n"]
+        mean_corr = v["corr"] / corr_n if corr_n > 0 else float("nan")
         cl_results[cl] = {
             "test_huber": v["hub"] / n,
-            "test_corr":  v["corr"] / n,
-            "n": v["n"],
+            "test_corr":  mean_corr,
+            "corr_valid_windows": corr_n,
+            "n": n,
         }
-        print(f"    {cl}: huber={v['hub']/n:.4f}  corr={v['corr']/n:.4f}  n={v['n']}")
-
+        n_nan = len(nan_windows[cl])
+        flag = f"  *** {n_nan}/{n} windows NaN (degenerate/constant) ***" if n_nan else ""
+        print(f"    {cl}: huber={v['hub']/n:.4f}  corr={mean_corr:.4f}  "
+              f"(valid {corr_n}/{n}){flag}")
+        
     vol_runs.commit(); vol_cache.commit()
     return {
         "model":            model_name,
